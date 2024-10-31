@@ -3,13 +3,13 @@ package main
 
 import (
 	"bytes"
-	"container/list"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -28,27 +28,25 @@ type ServiceConfig struct {
 
 // LLMRequest is used for requests to the LLM API.
 type LLMRequest struct {
-	NodeUUID string `json:"node_uuid"`
+	NodeUUID string `json:"node"`
 	Token    string `json:"token"`
-	InputHex string `json:"input_hex"`
+	InputHex string `json:"input"`
 	Service  string `json:"service"`
 	Protocol string `json:"protocol"`
 	Port     string `json:"port"`
+	Session  string `json:"session"`
+	RemoteIP string `json:"remote_ip"`
 }
 
 // LLMResponse represents the response from the LLM API.
 type LLMResponse struct {
-	IsAttack        bool   `json:"is_attack"`
-	AttackType      string `json:"attack_type"`
-	ResponseHex     string `json:"response_hex"`
-	AttackGroupKey  string `json:"attack_group_key"`
-	AdditionalNotes string `json:"additional_notes"`
-}
-
-// CacheEntry represents a single cache entry with the response and element position.
-type CacheEntry struct {
-	Response LLMResponse
-	Element  *list.Element
+	IsAttack        bool   `json:"isattack"`
+	AttackType      string `json:"type"`
+	ResponseHex     string `json:"response"`
+	AttackGroupKey  string `json:"groupkey"`
+	AdditionalNotes string `json:"notes"`
+	Delay           int    `json:"delay"`    // Delay in milliseconds before responding
+	Continue        bool   `json:"continue"` // Indicates if connection should continue
 }
 
 var (
@@ -66,40 +64,7 @@ var (
 	activeConns       = make(map[string]int)
 	blacklist         = make(map[string]time.Time)
 	mu                sync.Mutex
-	cache             = make(map[string]*CacheEntry)
-	cacheOrder        = list.New()
-	cacheLimit        int
 )
-
-// LRU cache management functions
-
-// addToCache adds a new entry to the cache and evicts the oldest if limit is reached.
-func addToCache(key string, response LLMResponse) {
-	if entry, found := cache[key]; found {
-		cacheOrder.MoveToFront(entry.Element)
-		return
-	}
-
-	if cacheOrder.Len() >= cacheLimit {
-		oldest := cacheOrder.Back()
-		if oldest != nil {
-			delete(cache, oldest.Value.(string))
-			cacheOrder.Remove(oldest)
-		}
-	}
-
-	element := cacheOrder.PushFront(key)
-	cache[key] = &CacheEntry{Response: response, Element: element}
-}
-
-// getFromCache retrieves an entry from the cache and moves it to the front.
-func getFromCache(key string) (*LLMResponse, bool) {
-	if entry, found := cache[key]; found {
-		cacheOrder.MoveToFront(entry.Element)
-		return &entry.Response, true
-	}
-	return nil, false
-}
 
 // Blacklisting functions
 
@@ -116,15 +81,16 @@ func isBlacklisted(ip string) bool {
 	return exists && time.Now().Before(expiry)
 }
 
+// Generate a unique session ID
+func generateSessionID() string {
+	return fmt.Sprintf("%d", rand.Int63())
+}
+
 // Functions for querying LLM and reporting attacks
 
-// queryLLM sends data to the LLM and caches the response.
-func queryLLM(inputData []byte, service, protocol, port string) (*LLMResponse, error) {
+// queryLLM sends data to the LLM without caching the response.
+func queryLLM(inputData []byte, service, protocol, port, session, remoteIP string) (*LLMResponse, error) {
 	inputHex := hex.EncodeToString(inputData)
-
-	if cachedResponse, found := getFromCache(inputHex); found {
-		return cachedResponse, nil
-	}
 
 	requestData := LLMRequest{
 		NodeUUID: nodeUUID,
@@ -133,18 +99,22 @@ func queryLLM(inputData []byte, service, protocol, port string) (*LLMResponse, e
 		Service:  service,
 		Protocol: protocol,
 		Port:     port,
+		Session:  session,
+		RemoteIP: remoteIP, // Include remote IP in the request
 	}
 
 	requestBody, err := json.Marshal(requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal LLM request: %v", err)
 	}
+
 	req, err := http.NewRequest("POST", llmApiUrl, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LLM API request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -152,31 +122,36 @@ func queryLLM(inputData []byte, service, protocol, port string) (*LLMResponse, e
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("LLM API responded with status: %s", resp.Status)
+	}
+
 	var llmResponse LLMResponse
 	if err := json.NewDecoder(resp.Body).Decode(&llmResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode LLM API response: %v", err)
 	}
 
-	addToCache(inputHex, llmResponse)
 	return &llmResponse, nil
 }
 
 // reportAttack sends a report of detected attacks to the report API.
-func reportAttack(inputData []byte, service, protocol, port string, llmResponse *LLMResponse, remoteAddr string) {
+func reportAttack(inputData []byte, service, protocol, port string, llmResponse *LLMResponse, remoteAddr, session string) {
 	inputHex := hex.EncodeToString(inputData)
 
 	attackData := map[string]interface{}{
-		"node_uuid":        nodeUUID,
-		"token":            authToken,
-		"input_hex":        inputHex,
-		"service":          service,
-		"protocol":         protocol,
-		"port":             port,
-		"attack_type":      llmResponse.AttackType,
-		"attack_group_key": llmResponse.AttackGroupKey,
-		"timestamp":        time.Now().UTC().Format(time.RFC3339),
-		"additional_notes": llmResponse.AdditionalNotes,
-		"source_ip":        remoteAddr,
+		"node":      nodeUUID,
+		"token":     authToken,
+		"input":     inputHex,
+		"service":   service,
+		"protocol":  protocol,
+		"port":      port,
+		"type":      llmResponse.AttackType,
+		"group":     llmResponse.AttackGroupKey,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"notes":     llmResponse.AdditionalNotes,
+		"sourceip":  remoteAddr,
+		"session":   session,
+		"remote_ip": remoteAddr, // Include remote IP in the attack report
 	}
 
 	requestBody, err := json.Marshal(attackData)
@@ -184,6 +159,7 @@ func reportAttack(inputData []byte, service, protocol, port string, llmResponse 
 		log.Printf("Failed to marshal attack report: %v", err)
 		return
 	}
+
 	req, err := http.NewRequest("POST", reportApiUrl, bytes.NewBuffer(requestBody))
 	if err != nil {
 		log.Printf("Failed to create attack report request: %v", err)
@@ -191,6 +167,7 @@ func reportAttack(inputData []byte, service, protocol, port string, llmResponse 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,6 +175,7 @@ func reportAttack(inputData []byte, service, protocol, port string, llmResponse 
 		return
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Attack report failed with status: %s", resp.Status)
 	}
@@ -206,7 +184,8 @@ func reportAttack(inputData []byte, service, protocol, port string, llmResponse 
 // handleConnection processes a TCP connection, sending data to LLM and reporting attacks if detected.
 func handleConnection(conn net.Conn, service, protocol, port string) {
 	defer conn.Close()
-	remoteAddr := conn.RemoteAddr().String()
+	session := generateSessionID()
+	remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String() // Extract IP without port
 	if isBlacklisted(remoteAddr) {
 		log.Printf("Blocked connection from blacklisted IP: %s", remoteAddr)
 		return
@@ -222,14 +201,28 @@ func handleConnection(conn net.Conn, service, protocol, port string) {
 			break
 		}
 		data := buf[:n]
-		llmResponse, err := queryLLM(data, service, protocol, port)
+		llmResponse, err := queryLLM(data, service, protocol, port, session, remoteAddr)
 		if err != nil {
 			log.Printf("Error querying LLM: %v", err)
 			continue
 		}
-		if llmResponse.IsAttack {
-			reportAttack(data, service, protocol, port, llmResponse, remoteAddr)
+
+		// Apply delay before responding, if specified
+		if llmResponse.Delay > 0 {
+			time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
 		}
+
+		// Check if the connection should be terminated and IP blacklisted
+		if !llmResponse.Continue {
+			log.Printf("Connection terminated and IP blacklisted: %s", remoteAddr)
+			blacklistIP(remoteAddr)
+			break
+		}
+
+		if llmResponse.IsAttack {
+			reportAttack(data, service, protocol, port, llmResponse, remoteAddr, session)
+		}
+
 		responseData, _ := hex.DecodeString(llmResponse.ResponseHex)
 		conn.Write(responseData)
 	}
@@ -274,14 +267,28 @@ func startUDPService(port, service string) {
 			continue
 		}
 		data := buf[:n]
-		llmResponse, err := queryLLM(data, service, "udp", port)
+		session := generateSessionID()
+		remoteIP := remoteAddr.IP.String() // Extract IP without port
+		llmResponse, err := queryLLM(data, service, "udp", port, session, remoteIP)
 		if err != nil {
 			log.Printf("Error querying LLM: %v", err)
 			continue
 		}
-		if llmResponse.IsAttack {
-			reportAttack(data, service, "udp", port, llmResponse, remoteAddr.String())
+
+		if llmResponse.Delay > 0 {
+			time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
 		}
+
+		if !llmResponse.Continue {
+			log.Printf("Connection terminated and IP blacklisted: %s", remoteIP)
+			blacklistIP(remoteIP)
+			continue
+		}
+
+		if llmResponse.IsAttack {
+			reportAttack(data, service, "udp", port, llmResponse, remoteIP, session)
+		}
+
 		responseData, _ := hex.DecodeString(llmResponse.ResponseHex)
 		conn.WriteToUDP(responseData, remoteAddr)
 	}
@@ -331,7 +338,6 @@ func main() {
 	flag.StringVar(&nodeUUID, "node-uuid", "", "Node UUID for identifying this honeypot instance")
 	flag.StringVar(&attackLogFilePath, "log-file", "attacks.log", "Path to attack log file")
 	flag.IntVar(&connLimit, "conn-limit", 5, "Maximum concurrent connections per IP")
-	flag.IntVar(&cacheLimit, "cache-limit", 100, "Maximum number of items in the response cache")
 	flag.Parse()
 
 	if apiKey == "" || authToken == "" || nodeUUID == "" {
