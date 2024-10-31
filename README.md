@@ -56,6 +56,49 @@ After building the binary, run the honeypot with the desired configuration:
     -cache-limit=100
 ```
 
+## Google Cloud Functions for Backend
+
+This project includes two Google Cloud Functions that provide essential backend services for the honeypot application. These functions are designed to be lightweight, flexible, and easy to deploy on Google Cloud, supporting both the LLM prediction and attack reporting functionalities.
+
+### Functions Overview
+
+1. **LLM Prediction Function (`llmPredict`)**
+
+   - **Purpose**: Acts as an interface for sending payloads to a Language Learning Model (LLM) like Google’s Gemini Flash to analyze potential threats based on the content.
+   - **Endpoint**: Receives hex-encoded payload data and metadata, decodes it, forwards it to the model, and returns a structured response indicating whether an attack is suspected.
+   - **Environment Variables**:
+     - `PROJECT_ID`: Google Cloud Project ID.
+     - `REGION`: Google Cloud region where the model is hosted.
+     - `MODEL_NAME`: Path to the LLM model (e.g., `projects/YOUR_PROJECT_ID/locations/YOUR_REGION/publishers/google/models/gemini-bison@001`).
+
+2. **Attack Report Function (`report`)**
+   - **Purpose**: Stores attack data sent from the honeypot in Google Cloud Firestore, providing centralized logging of potential threats.
+   - **Endpoint**: Receives JSON-formatted reports from the honeypot application, verifies required fields, and saves the information in the Firestore `attack_reports` collection.
+   - **Firestore Collection**: `attack_reports`
+
+### Deployment Instructions
+
+1. **Set Up Google Cloud Project**: Ensure that you have a Google Cloud project set up, with the Vertex AI API enabled for `llmPredict` and Firestore API enabled for `report`.
+2. **Service Account Permissions**: The service account for these functions needs `aiplatform.models.predict` permission for the `llmPredict` function and `datastore.databases.write` permission for the `report` function.
+3. **Deploy the Functions**:
+
+   ```bash
+   # Deploy the LLM Prediction function
+   gcloud functions deploy llmPredict \
+       --runtime nodejs20 \
+       --trigger-http \
+       --allow-unauthenticated \
+       --region YOUR_REGION \
+       --set-env-vars PROJECT_ID=YOUR_PROJECT_ID,MODEL_NAME=projects/YOUR_PROJECT_ID/locations/YOUR_REGION/publishers/google/models/gemini-bison@001
+
+   # Deploy the Attack Report function
+   gcloud functions deploy report \
+       --runtime nodejs20 \
+       --trigger-http \
+       --allow-unauthenticated \
+       --region YOUR_REGION
+   ```
+
 ## Contributing
 
 Contributions are welcome! Feel free to submit pull requests or open issues for improvements and bug fixes.
