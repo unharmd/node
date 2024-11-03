@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://cdn.unharmd.com/logo.png" alt="Unharmd Logo" width="256" title="Unharmd Logo">
+</p>
+
 # Unharmd Edge Node
 
 This project is a honeypot edge designed to simulate network services, monitor interactions, and detect potential malicious activity using a Language Model (LLM). By analyzing incoming payloads, the honeypot can identify attack attempts and respond accordingly. It also caches responses to reduce LLM usage and includes session tracking for comprehensive attack reports.
