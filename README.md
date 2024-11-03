@@ -84,20 +84,21 @@ This project includes two Google Cloud Functions that provide essential backend 
 
    ```bash
    # Deploy the LLM Prediction function
-   gcloud functions deploy llmPredict \
-       --runtime nodejs20 \
-       --trigger-http \
-       --allow-unauthenticated \
-       --region YOUR_REGION \
-       --set-env-vars PROJECT_ID=YOUR_PROJECT_ID,MODEL_NAME=projects/YOUR_PROJECT_ID/locations/YOUR_REGION/publishers/google/models/gemini-bison@001
+   gcloud functions deploy predict \
+    --runtime nodejs20 \
+    --trigger-http \
+    --allow-unauthenticated \
+    --entry-point predict
 
    # Deploy the Attack Report function
-   gcloud functions deploy report \
-       --runtime nodejs20 \
-       --trigger-http \
-       --allow-unauthenticated \
-       --region YOUR_REGION
+   gcloud functions deploy status \
+    --runtime nodejs20 \
+    --trigger-http \
+    --allow-unauthenticated \
+    --entry-point predict
    ```
+
+> These functions serve as samples, you can build your own business logic it like we did at https://unharmd.com
 
 ## Contributing
 

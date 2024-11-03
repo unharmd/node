@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -13,94 +14,129 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/disk"
+	psutilNet "github.com/shirou/gopsutil/net"
 )
 
-// ServiceConfig represents the configuration for a service to be simulated.
+// ServiceConfig holds the configuration for each honeypot service.
 type ServiceConfig struct {
 	Port     string `json:"port"`
 	Protocol string `json:"protocol"`
-	Service  string `json:"service"`
+	UID      string `json:"uid"`
 }
 
-// LLMRequest is used for requests to the LLM API.
+// LLMRequest defines the structure of requests to the LLM API.
 type LLMRequest struct {
 	NodeUUID string `json:"node"`
 	Token    string `json:"token"`
 	InputHex string `json:"input"`
-	Service  string `json:"service"`
 	Protocol string `json:"protocol"`
 	Port     string `json:"port"`
 	Session  string `json:"session"`
 	RemoteIP string `json:"remote_ip"`
+	UID      string `json:"uid"`
 }
 
-// LLMResponse represents the response from the LLM API.
+// LLMResponse represents the minimal response structure from the LLM API.
 type LLMResponse struct {
-	IsAttack        bool   `json:"isattack"`
-	AttackType      string `json:"type"`
-	ResponseHex     string `json:"response"`
-	AttackGroupKey  string `json:"groupkey"`
-	AdditionalNotes string `json:"notes"`
-	Delay           int    `json:"delay"`    // Delay in milliseconds before responding
-	Continue        bool   `json:"continue"` // Indicates if connection should continue
+	ResponseHex string `json:"response"`
+	Delay       int    `json:"delay"`
+	Continue    bool   `json:"continue"`
+}
+
+// StatusReport defines the structure of the status report sent to the server.
+type StatusReport struct {
+	NodeUUID             string         `json:"node"`
+	Token                string         `json:"token"`
+	StartTime            time.Time      `json:"start_time"`
+	Uptime               string         `json:"uptime"`
+	NumGoroutines        int            `json:"num_goroutines"`
+	MemoryAlloc          uint64         `json:"memory_alloc"`
+	MemorySys            uint64         `json:"memory_sys"`
+	CPUUsage             float64        `json:"cpu_usage"`
+	NetworkBytes         uint64         `json:"network_bytes"`
+	DiskTotal            uint64         `json:"disk_total"`
+	DiskFree             uint64         `json:"disk_free"`
+	DiskUsed             uint64         `json:"disk_used"`
+	ActiveGlobalRequests int32          `json:"active_global_requests"`
+	GlobalRequestLimit   int            `json:"global_request_limit"`
+	ActiveConnections    map[string]int `json:"active_connections"`
 }
 
 var (
-	servicesStr       string
-	configFile        string
-	services          []ServiceConfig
-	llmApiUrl         string
-	reportApiUrl      string
-	apiKey            string
-	authToken         string
-	nodeUUID          string
-	wg                sync.WaitGroup
-	attackLogFilePath string
-	connLimit         int
-	activeConns       = make(map[string]int)
-	blacklist         = make(map[string]time.Time)
-	mu                sync.Mutex
+	servicesStr          string
+	services             []ServiceConfig
+	llmApiUrl            string
+	statusApiUrl         string
+	apiKey               string
+	nodeUUID             string
+	startTime            time.Time
+	connLimit            int
+	globalRequestLimit   int // Maximum concurrent global requests
+	activeGlobalRequests int32
+	activeConns          = make(map[string]int)
+	localBlacklist       = make(map[string]time.Time) // Local blacklist managed by the node
+	globalBlacklist      = make(map[string]struct{})  // Global blacklist managed by the central server
+	mu                   sync.Mutex
+	totalNetworkBytes    uint64
+	httpClient           *http.Client
+	wg                   sync.WaitGroup
+	ipRequestQueues      = make(map[string]chan []byte) // Buffered channel per IP
+	ipActiveRequests     = make(map[string]bool)        // Track active requests per IP
+	queueLock            sync.Mutex                     // Lock for the request queues map
+	cancelFunc           context.CancelFunc
 )
 
-// Blacklisting functions
+// initHTTPClient initializes a shared HTTP client with timeout.
+func initHTTPClient() {
+	httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+	}
+}
 
+// blacklistIP adds an IP to the local blacklist.
 func blacklistIP(ip string) {
 	mu.Lock()
 	defer mu.Unlock()
-	blacklist[ip] = time.Now().Add(1 * time.Hour)
+	localBlacklist[ip] = time.Now().Add(1 * time.Hour)
 }
 
+// isBlacklisted checks if an IP is blacklisted (either locally or globally).
 func isBlacklisted(ip string) bool {
 	mu.Lock()
 	defer mu.Unlock()
-	expiry, exists := blacklist[ip]
-	return exists && time.Now().Before(expiry)
+	_, globallyBlacklisted := globalBlacklist[ip]
+	_, locallyBlacklisted := localBlacklist[ip]
+	return globallyBlacklisted || (locallyBlacklisted && time.Now().Before(localBlacklist[ip]))
 }
 
-// Generate a unique session ID
+// generateSessionID creates a unique session ID.
 func generateSessionID() string {
 	return fmt.Sprintf("%d", rand.Int63())
 }
 
-// Functions for querying LLM and reporting attacks
-
-// queryLLM sends data to the LLM without caching the response.
-func queryLLM(inputData []byte, service, protocol, port, session, remoteIP string) (*LLMResponse, error) {
+// queryLLM sends data to the LLM API and retrieves the response.
+func queryLLM(inputData []byte, protocol, port, session, remoteIP, uid string) (*LLMResponse, error) {
 	inputHex := hex.EncodeToString(inputData)
 
 	requestData := LLMRequest{
 		NodeUUID: nodeUUID,
-		Token:    authToken,
+		Token:    apiKey,
 		InputHex: inputHex,
-		Service:  service,
 		Protocol: protocol,
 		Port:     port,
 		Session:  session,
-		RemoteIP: remoteIP, // Include remote IP in the request
+		RemoteIP: remoteIP,
+		UID:      uid,
 	}
 
 	requestBody, err := json.Marshal(requestData)
@@ -113,10 +149,8 @@ func queryLLM(inputData []byte, service, protocol, port, session, remoteIP strin
 		return nil, fmt.Errorf("failed to create LLM API request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
-	client := &http.Client{Timeout: 3 * 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("LLM API request failed: %v", err)
 	}
@@ -134,227 +168,239 @@ func queryLLM(inputData []byte, service, protocol, port, session, remoteIP strin
 	return &llmResponse, nil
 }
 
-// reportAttack sends a report of detected attacks to the report API.
-func reportAttack(inputData []byte, service, protocol, port string, llmResponse *LLMResponse, remoteAddr, session string) {
-	inputHex := hex.EncodeToString(inputData)
+// processRequestQueue handles incoming requests for each IP.
+func processRequestQueue(ip string, serviceConfig ServiceConfig) {
+	defer func() {
+		queueLock.Lock()
+		delete(ipRequestQueues, ip)
+		delete(ipActiveRequests, ip)
+		queueLock.Unlock()
+	}()
 
-	attackData := map[string]interface{}{
-		"node":      nodeUUID,
-		"token":     authToken,
-		"input":     inputHex,
-		"service":   service,
-		"protocol":  protocol,
-		"port":      port,
-		"type":      llmResponse.AttackType,
-		"group":     llmResponse.AttackGroupKey,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"notes":     llmResponse.AdditionalNotes,
-		"sourceip":  remoteAddr,
-		"session":   session,
-		"remote_ip": remoteAddr, // Include remote IP in the attack report
-	}
+	for data := range ipRequestQueues[ip] {
+		if atomic.LoadInt32(&activeGlobalRequests) >= int32(globalRequestLimit) {
+			log.Printf("Global request limit reached, delaying IP %s", ip)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
 
-	requestBody, err := json.Marshal(attackData)
-	if err != nil {
-		log.Printf("Failed to marshal attack report: %v", err)
-		return
-	}
+		atomic.AddInt32(&activeGlobalRequests, 1)
+		session := generateSessionID()
+		llmResponse, err := queryLLM(data, serviceConfig.Protocol, serviceConfig.Port, session, ip, serviceConfig.UID)
+		atomic.AddInt32(&activeGlobalRequests, -1)
 
-	req, err := http.NewRequest("POST", reportApiUrl, bytes.NewBuffer(requestBody))
-	if err != nil {
-		log.Printf("Failed to create attack report request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+		if err != nil {
+			log.Printf("Error querying LLM for IP %s: %v", ip, err)
+			continue
+		}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Attack report request failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+		if !llmResponse.Continue {
+			log.Printf("Connection terminated and IP blacklisted: %s", ip)
+			blacklistIP(ip)
+			break
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Attack report failed with status: %s", resp.Status)
+		if llmResponse.Delay > 0 {
+			time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
+		}
 	}
 }
 
-// handleConnection processes a TCP connection, sending data to LLM and reporting attacks if detected.
-func handleConnection(conn net.Conn, service, protocol, port string) {
+// handleConnection manages each client connection, adding data to the request queue for each IP.
+func handleConnection(ctx context.Context, conn net.Conn, serviceConfig ServiceConfig) {
 	defer conn.Close()
-	session := generateSessionID()
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String() // Extract IP without port
+	remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 	if isBlacklisted(remoteAddr) {
 		log.Printf("Blocked connection from blacklisted IP: %s", remoteAddr)
 		return
 	}
 
+	queueLock.Lock()
+	if _, exists := ipRequestQueues[remoteAddr]; !exists {
+		ipRequestQueues[remoteAddr] = make(chan []byte, 10)
+		go processRequestQueue(remoteAddr, serviceConfig)
+	}
+	queueLock.Unlock()
+
 	buf := make([]byte, 4096)
 	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Error reading from %s: %v", remoteAddr, err)
+		select {
+		case <-ctx.Done():
+			log.Printf("Connection handling stopped for IP: %s", remoteAddr)
+			return
+		default:
+			n, err := conn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Error reading from %s: %v", remoteAddr, err)
+				}
+				return
 			}
-			break
-		}
-		data := buf[:n]
-		llmResponse, err := queryLLM(data, service, protocol, port, session, remoteAddr)
-		if err != nil {
-			log.Printf("Error querying LLM: %v", err)
-			continue
-		}
+			data := make([]byte, n)
+			copy(data, buf[:n])
 
-		// Apply delay before responding, if specified
-		if llmResponse.Delay > 0 {
-			time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
+			select {
+			case ipRequestQueues[remoteAddr] <- data:
+			default:
+				log.Printf("Request buffer full for IP %s, data discarded", remoteAddr)
+			}
 		}
-
-		// Check if the connection should be terminated and IP blacklisted
-		if !llmResponse.Continue {
-			log.Printf("Connection terminated and IP blacklisted: %s", remoteAddr)
-			blacklistIP(remoteAddr)
-			break
-		}
-
-		if llmResponse.IsAttack {
-			reportAttack(data, service, protocol, port, llmResponse, remoteAddr, session)
-		}
-
-		responseData, _ := hex.DecodeString(llmResponse.ResponseHex)
-		conn.Write(responseData)
 	}
 }
 
-// TCP and UDP service functions
-
-func startTCPService(port, service string) {
+// startTCPService starts a TCP service on the specified port.
+func startTCPService(ctx context.Context, serviceConfig ServiceConfig) {
 	defer wg.Done()
-	ln, err := net.Listen("tcp", ":"+port)
+	ln, err := net.Listen("tcp", ":"+serviceConfig.Port)
 	if err != nil {
-		log.Fatalf("Error starting TCP service on port %s: %v", port, err)
+		log.Fatalf("Error starting TCP service on port %s: %v", serviceConfig.Port, err)
 	}
-	log.Printf("TCP service '%s' started on port %s", service, port)
+	log.Printf("TCP service '%s' started on port %s", serviceConfig.UID, serviceConfig.Port)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection on port %s: %v", port, err)
-			continue
-		}
-		go handleConnection(conn, service, "tcp", port)
-	}
-}
-
-func startUDPService(port, service string) {
-	defer wg.Done()
-	p, err := strconv.Atoi(port)
-	if err != nil {
-		log.Fatalf("Invalid port number: %s", port)
-	}
-	addr := net.UDPAddr{Port: p, IP: net.ParseIP("0.0.0.0")}
-	conn, err := net.ListenUDP("udp", &addr)
-	if err != nil {
-		log.Fatalf("Error starting UDP service on port %s: %v", port, err)
-	}
-	log.Printf("UDP service '%s' started on port %s", service, port)
-	buf := make([]byte, 4096)
-	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("Error reading from UDP on port %s: %v", port, err)
-			continue
-		}
-		data := buf[:n]
-		session := generateSessionID()
-		remoteIP := remoteAddr.IP.String() // Extract IP without port
-		llmResponse, err := queryLLM(data, service, "udp", port, session, remoteIP)
-		if err != nil {
-			log.Printf("Error querying LLM: %v", err)
-			continue
-		}
-
-		if llmResponse.Delay > 0 {
-			time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
-		}
-
-		if !llmResponse.Continue {
-			log.Printf("Connection terminated and IP blacklisted: %s", remoteIP)
-			blacklistIP(remoteIP)
-			continue
-		}
-
-		if llmResponse.IsAttack {
-			reportAttack(data, service, "udp", port, llmResponse, remoteIP, session)
-		}
-
-		responseData, _ := hex.DecodeString(llmResponse.ResponseHex)
-		conn.WriteToUDP(responseData, remoteAddr)
-	}
-}
-
-// Helper function for parsing services
-func parseServices() {
-	if servicesStr != "" {
-		serviceList := strings.Split(servicesStr, ",")
-		for _, svc := range serviceList {
-			parts := strings.Split(svc, "/")
-			if len(parts) != 3 {
-				log.Fatalf("Invalid service format: %s. Expected 'port/protocol/service'", svc)
+			select {
+			case <-ctx.Done():
+				log.Printf("Shutting down TCP service on port %s", serviceConfig.Port)
+				return
+			default:
+				log.Printf("Error accepting connection on port %s: %v", serviceConfig.Port, err)
+				continue
 			}
-			services = append(services, ServiceConfig{
-				Port:     parts[0],
-				Protocol: strings.ToLower(parts[1]),
-				Service:  parts[2],
-			})
 		}
-	} else if configFile != "" {
-		data, err := os.ReadFile(configFile)
-		if err != nil {
-			log.Fatalf("Error reading config file: %v", err)
+		go handleConnection(ctx, conn, serviceConfig)
+	}
+}
+
+// sendStatusReport sends a status report with system metrics every minute and updates the global blacklist.
+func sendStatusReport(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Minute):
+			uptime := time.Since(startTime).String()
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			cpuPercent, _ := cpu.Percent(0, false)
+			netStats, _ := psutilNet.IOCounters(false)
+			if len(netStats) > 0 {
+				atomic.StoreUint64(&totalNetworkBytes, netStats[0].BytesSent+netStats[0].BytesRecv)
+			}
+
+			diskStats, _ := disk.Usage("/")
+			statusReport := StatusReport{
+				NodeUUID:             nodeUUID,
+				Token:                apiKey,
+				StartTime:            startTime,
+				Uptime:               uptime,
+				NumGoroutines:        runtime.NumGoroutine(),
+				MemoryAlloc:          m.Alloc,
+				MemorySys:            m.Sys,
+				CPUUsage:             cpuPercent[0],
+				NetworkBytes:         atomic.LoadUint64(&totalNetworkBytes),
+				DiskTotal:            diskStats.Total,
+				DiskFree:             diskStats.Free,
+				DiskUsed:             diskStats.Used,
+				ActiveGlobalRequests: atomic.LoadInt32(&activeGlobalRequests),
+				GlobalRequestLimit:   globalRequestLimit,
+			}
+
+			requestBody, err := json.Marshal(statusReport)
+			if err != nil {
+				log.Printf("Failed to marshal status report: %v", err)
+				continue
+			}
+
+			req, err := http.NewRequest("POST", statusApiUrl, bytes.NewBuffer(requestBody))
+			if err != nil {
+				log.Printf("Failed to create status report request: %v", err)
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				log.Printf("Status report request failed: %v", err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var globalBlacklistResponse struct {
+					BlacklistedIPs []string `json:"blacklisted_ips"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&globalBlacklistResponse); err != nil {
+					log.Printf("Failed to decode global blacklist response: %v", err)
+					continue
+				}
+
+				mu.Lock()
+				for _, ip := range globalBlacklistResponse.BlacklistedIPs {
+					globalBlacklist[ip] = struct{}{}
+				}
+				mu.Unlock()
+			} else {
+				log.Printf("Status report failed with status: %s", resp.Status)
+			}
 		}
-		var cfg struct {
-			Services []ServiceConfig `json:"services"`
-		}
-		err = json.Unmarshal(data, &cfg)
-		if err != nil {
-			log.Fatalf("Error parsing config file: %v", err)
-		}
-		services = cfg.Services
-	} else {
-		log.Fatal("No services specified. Use the -services flag or -config file.")
 	}
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	flag.StringVar(&servicesStr, "services", "", "List of services in 'port/protocol/service' format, separated by commas")
-	flag.StringVar(&configFile, "config", "", "Path to JSON configuration file")
+	startTime = time.Now()
+	initHTTPClient()
+
+	flag.StringVar(&servicesStr, "services", "", "List of services in 'port/protocol/uid' format, separated by commas")
 	flag.StringVar(&llmApiUrl, "llm-api", "http://localhost:8080/llm", "LLM API URL")
-	flag.StringVar(&reportApiUrl, "report-api", "http://localhost:8080/report", "Central report API URL")
+	flag.StringVar(&statusApiUrl, "status-api", "http://localhost:8080/status", "Status report API URL")
 	flag.StringVar(&apiKey, "api-key", "", "API key for authentication")
-	flag.StringVar(&authToken, "auth-token", "", "Token for authenticating with APIs")
 	flag.StringVar(&nodeUUID, "node-uuid", "", "Node UUID for identifying this honeypot instance")
-	flag.StringVar(&attackLogFilePath, "log-file", "attacks.log", "Path to attack log file")
 	flag.IntVar(&connLimit, "conn-limit", 5, "Maximum concurrent connections per IP")
+	flag.IntVar(&globalRequestLimit, "global-limit", 4, "Maximum global concurrent requests allowed")
 	flag.Parse()
 
-	if apiKey == "" || authToken == "" || nodeUUID == "" {
-		log.Fatal("API key, auth token, and node UUID are required")
+	if apiKey == "" || nodeUUID == "" || servicesStr == "" {
+		log.Fatal("API key, node UUID, and services are required")
 	}
 
-	parseServices()
+	serviceList := strings.Split(servicesStr, ",")
+	for _, svc := range serviceList {
+		parts := strings.Split(svc, "/")
+		if len(parts) != 3 {
+			log.Fatalf("Invalid service format: %s. Expected 'port/protocol/uid'", svc)
+		}
+		services = append(services, ServiceConfig{
+			Port:     parts[0],
+			Protocol: strings.ToLower(parts[1]),
+			UID:      parts[2],
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelFunc = cancel
+
+	go sendStatusReport(ctx)
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-c
+		log.Println("Received termination signal. Shutting down...")
+		cancelFunc()
+		wg.Wait()
+		log.Println("Honeypot instance has shut down.")
+		os.Exit(0)
+	}()
+
 	for _, svc := range services {
 		wg.Add(1)
-		switch svc.Protocol {
-		case "tcp":
-			go startTCPService(svc.Port, svc.Service)
-		case "udp":
-			go startUDPService(svc.Port, svc.Service)
-		default:
-			log.Fatalf("Unsupported protocol: %s", svc.Protocol)
-		}
+		go startTCPService(ctx, svc)
 	}
+
 	wg.Wait()
 }

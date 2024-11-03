@@ -1,8 +1,9 @@
 // index.js
 
-const { PredictionServiceClient } = require('@google-cloud/aiplatform')
-const { locationPath } = require('@google-cloud/aiplatform').v1
-const functions = require('@google-cloud/functions-framework')
+const { PredictionServiceClient } = require('@google-cloud/aiplatform').v1
+const {
+  CloudFunctionsServiceClient
+} = require('@google-cloud/functions-framework')
 const Buffer = require('buffer').Buffer
 
 // Environment variables for configuration
@@ -33,14 +34,14 @@ async function predictContent (inputText) {
 }
 
 // HTTP Cloud Function to handle requests
-functions.http('predict', async (req, res) => {
+CloudFunctionsServiceClient.http('predict', async (req, res) => {
   try {
     // Parse the JSON request payload
     const { node_uuid, token, input_hex, service, protocol, port } = req.body
 
     // Validate input fields
     if (!node_uuid || !token || !input_hex || !service || !protocol || !port) {
-      return res.status(400).send('Missing required fields')
+      return res.status(400).json({ error: 'Missing required fields' })
     }
 
     // Decode the hex input to plain text
@@ -52,25 +53,17 @@ functions.http('predict', async (req, res) => {
     // Convert the response back to hex
     const responseHex = Buffer.from(responseText, 'utf-8').toString('hex')
 
-    // Simulated attack detection logic (for demonstration purposes)
-    const isAttack = responseText.toLowerCase().includes('malicious')
-    const attackType = isAttack ? 'Suspicious Activity' : 'None'
-
-    // Construct the response
+    // Construct the honeypot-compatible response
     const response = {
-      is_attack: isAttack,
-      attack_type: attackType,
-      response_hex: responseHex,
-      attack_group_key: isAttack ? 'group-123' : '',
-      additional_notes: isAttack
-        ? 'Potential threat detected based on content analysis.'
-        : ''
+      response: responseHex, // Hex-encoded response text
+      delay: 1000, // 1-second delay (for example)
+      continue: true // Allow continuation (for demonstration)
     }
 
     // Send the JSON response
     res.status(200).json(response)
   } catch (error) {
     console.error('Error processing request:', error)
-    res.status(500).send(`Error: ${error.message}`)
+    res.status(500).json({ error: `Error: ${error.message}` })
   }
 })
