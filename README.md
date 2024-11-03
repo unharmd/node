@@ -20,65 +20,43 @@ This project is a honeypot edge designed to simulate network services, monitor i
 - **LLM API Endpoint**: Requires access to a Language Model API (e.g., Google Gemini).
 - **Reporting API**: An endpoint to log detected attacks and maintain a centralized attack database.
 
+# Honeypot Configuration and Command-Line Flags
+
 ## Configuration
 
-### Environment Variables
+## Command-Line Flags
 
-- `LLM_API_URL` – URL of the LLM API for payload analysis.
-- `REPORT_API_URL` – URL of the API to report detected attacks.
-- `API_KEY` – API key for authenticating with the LLM and reporting APIs.
-- `AUTH_TOKEN` – Authentication token for verifying the node's identity with the API.
-- `NODE_UUID` – Unique identifier for the honeypot instance, generated externally and passed to the honeypot on startup.
+- **-services** – List of services to simulate in `port/protocol/uid` format, separated by commas.  
+  Example: `-services=80/tcp/HTTP,22/tcp/SSH`.
+- **-config** – Path to a JSON configuration file defining services.
+- **-llm-api** – URL of the LLM API (overrides environment variable).
+- **-report-api** – URL of the reporting API (overrides environment variable).
+- **-api-key** – API key for authenticating with APIs (overrides environment variable).
+- **-auth-token** – Token for authenticating the node (overrides environment variable).
+- **-node-uuid** – UUID for the honeypot instance, allowing central tracking (must be unique).
+- **-log-file** – Path to save the attack log file.
+- **-conn-limit** – Maximum concurrent connections per IP.
+- **-cache-limit** – Maximum number of entries in the response cache.
+- **-global-limit** – Maximum global concurrent requests allowed across all connections.
 
-### Command-Line Flags
+## Example Usage
 
-- `-services` – List of services to simulate in `port/protocol/service` format, separated by commas. Example: `-services=80/tcp/HTTP,22/tcp/SSH`.
-- `-config` – Path to a JSON configuration file defining services.
-- `-llm-api` – URL of the LLM API (overrides environment variable).
-- `-report-api` – URL of the reporting API (overrides environment variable).
-- `-api-key` – API key for authenticating with APIs (overrides environment variable).
-- `-auth-token` – Token for authenticating the node (overrides environment variable).
-- `-node-uuid` – UUID for the honeypot instance, allowing central tracking (must be unique).
-- `-log-file` – Path to save the attack log file.
-- `-conn-limit` – Maximum concurrent connections per IP.
-- `-cache-limit` – Maximum number of entries in the response cache.
+````bash
+./honeypot -services="80/tcp/HTTP,22/tcp/SSH" \
+           -llm-api="https://api.example.com/llm" \
+           -report-api="https://api.example.com/report" \
+           -api-key="YOUR_API_KEY" \
+           -auth-token="YOUR_AUTH_TOKEN" \
+           -node-uuid="unique-node-1234" \
+           -log-file="/var/log/honeypot.log" \
+           -conn-limit=10 \
+           -cache-limit=50 \
+           -global-limit=100
 
-## Usage
-
-After building the binary, run the honeypot with the desired configuration:
-
-```bash
-./unharmed-node-${arch} \
-    -services="80/tcp/HTTP,22/tcp/SSH" \
-    -llm-api="http://localhost:8080/llm" \
-    -report-api="http://localhost:8080/report" \
-    -api-key="YOUR_API_KEY" \
-    -auth-token="YOUR_AUTH_TOKEN" \
-    -node-uuid="YOUR_UNIQUE_NODE_UUID" \
-    -log-file="attacks.log" \
-    -conn-limit=5 \
-    -cache-limit=100
-```
 
 ## Google Cloud Functions for Backend
 
-This project includes two Google Cloud Functions that provide essential backend services for the honeypot application. These functions are designed to be lightweight, flexible, and easy to deploy on Google Cloud, supporting both the LLM prediction and attack reporting functionalities.
-
-### Functions Overview
-
-1. **LLM Prediction Function (`llmPredict`)**
-
-   - **Purpose**: Acts as an interface for sending payloads to a Language Learning Model (LLM) like Google’s Gemini Flash to analyze potential threats based on the content.
-   - **Endpoint**: Receives hex-encoded payload data and metadata, decodes it, forwards it to the model, and returns a structured response indicating whether an attack is suspected.
-   - **Environment Variables**:
-     - `PROJECT_ID`: Google Cloud Project ID.
-     - `REGION`: Google Cloud region where the model is hosted.
-     - `MODEL_NAME`: Path to the LLM model (e.g., `projects/YOUR_PROJECT_ID/locations/YOUR_REGION/publishers/google/models/gemini-bison@001`).
-
-2. **Attack Report Function (`report`)**
-   - **Purpose**: Stores attack data sent from the honeypot in Google Cloud Firestore, providing centralized logging of potential threats.
-   - **Endpoint**: Receives JSON-formatted reports from the honeypot application, verifies required fields, and saves the information in the Firestore `attack_reports` collection.
-   - **Firestore Collection**: `attack_reports`
+This project includes two Google Cloud Functions that provide essential backend services for the honeypot application. These functions are designed to be lightweight, flexible, and easy to deploy on Google Cloud, supporting both the LLM prediction and node status reporting features.
 
 ### Deployment Instructions
 
@@ -100,7 +78,7 @@ This project includes two Google Cloud Functions that provide essential backend 
     --trigger-http \
     --allow-unauthenticated \
     --entry-point predict
-   ```
+````
 
 > These functions serve as samples, you can build your own business logic it like we did at https://unharmd.com
 
