@@ -127,9 +127,20 @@ func handleLLMRequest(w http.ResponseWriter, r *http.Request, protocol string, s
 		}
 	}
 
-	// Set status code and body from the LLM response
+	// Set status code from the LLM response
 	w.WriteHeader(llmResponse.StatusCode)
-	w.Write(llmResponse.Body)
+
+	// Write either binary or text response
+	if len(llmResponse.BinaryResponse) > 0 {
+		binaryData, err := hex.DecodeString(llmResponse.BinaryResponse)
+		if err == nil {
+			w.Write(binaryData)
+		} else {
+			log.Printf("[ERROR] Failed to decode binary response: %v", err)
+		}
+	} else {
+		w.Write([]byte(llmResponse.TextResponse))
+	}
 
 	// If continue is false, do not process further requests from this connection
 	if !llmResponse.Continue {
@@ -139,11 +150,12 @@ func handleLLMRequest(w http.ResponseWriter, r *http.Request, protocol string, s
 
 // LLMResponse represents the response from the LLM API, including headers, body, delay, and whether to continue.
 type LLMResponse struct {
-	StatusCode int                 `json:"status_code"`
-	Headers    map[string][]string `json:"headers"`
-	Body       []byte              `json:"body"`
-	Delay      int                 `json:"delay"`
-	Continue   bool                `json:"continue"`
+	StatusCode     int                 `json:"statuscode"`
+	Headers        map[string][]string `json:"headers"`
+	TextResponse   string              `json:"textresponse"`
+	BinaryResponse string              `json:"binaryresponse"`
+	Delay          int                 `json:"delay"`
+	Continue       bool                `json:"continue"`
 }
 
 // queryLLM sends a request to the LLM API with the given input data and protocol details and receives a response.
