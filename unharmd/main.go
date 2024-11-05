@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,8 +77,19 @@ func startHTTPService(ctx context.Context, serviceConfig ServiceConfig) error {
 
 // startHTTPSServer starts an HTTPS server honeypot on the specified port.
 func startHTTPSServer(ctx context.Context, serviceConfig ServiceConfig) error {
-	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	certPath := "/var/unharmd/cert.pem"
+	keyPath := "/var/unharmd/key.pem"
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+
+	if os.IsNotExist(certErr) || os.IsNotExist(keyErr) {
+		log.Printf("[WARN] HTTPS certificates not found in %s and %s. HTTPS server cannot be started.", certPath, keyPath)
+		return fmt.Errorf("certificate or key not found")
+	}
+
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
+		log.Printf("[ERROR] Failed to load SSL certificates: %v", err)
 		return fmt.Errorf("failed to load SSL certificates: %v", err)
 	}
 
@@ -101,100 +114,127 @@ func startHTTPSServer(ctx context.Context, serviceConfig ServiceConfig) error {
 // handleLLMRequest handles incoming HTTP/HTTPS requests and sends them to the LLM for a response.
 func handleLLMRequest(w http.ResponseWriter, r *http.Request, protocol string, serviceConfig ServiceConfig) {
 	if atomic.LoadInt32(&activeGlobalRequests) >= int32(globalRequestLimit) {
+		log.Printf("[WARN] Global request limit reached. Rejecting request from %s", r.RemoteAddr)
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	atomic.AddInt32(&activeGlobalRequests, 1)
 	defer atomic.AddInt32(&activeGlobalRequests, -1)
 
-	// Prepare input data for LLM
-	inputData := []byte(r.URL.String())
-	llmResponse, err := queryLLM(inputData, protocol, serviceConfig.Port, r.RemoteAddr, serviceConfig.UID)
+	// Extract only the IP address from the remote address
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
+		log.Printf("[ERROR] Failed to parse remote address %s: %v", r.RemoteAddr, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[INFO] Processing request from IP: %s", remoteIP)
+
+	// Capture the full raw HTTP request, including headers and body
+	var rawRequest bytes.Buffer
+	if err := r.Write(&rawRequest); err != nil {
+		log.Printf("[ERROR] Failed to capture raw HTTP request: %v", err)
+		http.Error(w, "Error processing request", http.StatusInternalServerError)
+		return
+	}
+
+	llmResponse, err := queryLLM(rawRequest.Bytes(), protocol, serviceConfig.Port, remoteIP, serviceConfig.UID, r.URL.Path)
+	if err != nil {
+		log.Printf("[ERROR] LLM query failed for IP %s: %v", remoteIP, err)
 		http.Error(w, "Error processing request", http.StatusInternalServerError)
 		return
 	}
 
 	// Handle delay if specified
 	if llmResponse.Delay > 0 {
+		log.Printf("[INFO] Applying delay of %d ms for response to IP: %s", llmResponse.Delay, remoteIP)
 		time.Sleep(time.Duration(llmResponse.Delay) * time.Millisecond)
 	}
 
 	// Set headers from the LLM response
-	for header, values := range llmResponse.Headers {
-		for _, value := range values {
-			w.Header().Add(header, value)
-		}
+	for header, value := range llmResponse.Headers {
+		w.Header().Set(header, value)
 	}
+	log.Printf("[DEBUG] Response headers set for IP %s: %+v", remoteIP, llmResponse.Headers)
 
-	// Set status code from the LLM response
-	w.WriteHeader(llmResponse.StatusCode)
-
-	// Write either binary or text response
-	if len(llmResponse.BinaryResponse) > 0 {
-		binaryData, err := hex.DecodeString(llmResponse.BinaryResponse)
+	// Decode the HEX-encoded response
+	if len(llmResponse.Response) > 0 {
+		responseData, err := hex.DecodeString(llmResponse.Response)
 		if err == nil {
-			w.Write(binaryData)
+			// Set Content-Length to the length of the decoded response
+			w.Header().Set("Content-Length", strconv.Itoa(len(responseData)))
+			w.WriteHeader(llmResponse.StatusCode)
+			_, writeErr := w.Write(responseData)
+			if writeErr != nil {
+				log.Printf("[ERROR] Failed to write response to IP %s: %v", remoteIP, writeErr)
+			}
+			log.Printf("[DEBUG] Sent HEX response to IP %s", remoteIP)
 		} else {
-			log.Printf("[ERROR] Failed to decode binary response: %v", err)
+			log.Printf("[ERROR] Failed to decode HEX response for IP %s: %v", remoteIP, err)
 		}
-	} else {
-		w.Write([]byte(llmResponse.TextResponse))
 	}
 
-	// If continue is false, do not process further requests from this connection
+	// If continue is false, log that the connection should be terminated
 	if !llmResponse.Continue {
+		log.Printf("[INFO] Closing connection for IP %s as per LLM instruction", remoteIP)
 		return
 	}
 }
 
 // LLMResponse represents the response from the LLM API, including headers, body, delay, and whether to continue.
 type LLMResponse struct {
-	StatusCode     int                 `json:"statuscode"`
-	Headers        map[string][]string `json:"headers"`
-	TextResponse   string              `json:"textresponse"`
-	BinaryResponse string              `json:"binaryresponse"`
-	Delay          int                 `json:"delay"`
-	Continue       bool                `json:"continue"`
+	StatusCode int               `json:"statuscode"`
+	Headers    map[string]string `json:"headers"`  // Map of headers from LLM API response
+	Response   string            `json:"response"` // HEX-encoded response string
+	Delay      int               `json:"delay"`
+	Continue   bool              `json:"continue"`
 }
 
-// queryLLM sends a request to the LLM API with the given input data and protocol details and receives a response.
-func queryLLM(inputData []byte, protocol, port, remoteIP, service string) (*LLMResponse, error) {
+// queryLLM sends a request to the LLM API with the given input data, protocol, port, remote IP, service, and path.
+func queryLLM(inputData []byte, protocol, port, remoteIP, service, path string) (*LLMResponse, error) {
 	requestData := map[string]interface{}{
 		"node":      nodeUUID,
 		"token":     apiKey,
-		"input":     hex.EncodeToString(inputData),
+		"input":     hex.EncodeToString(inputData), // HEX-encoded raw HTTP request
 		"protocol":  protocol,
 		"port":      port,
 		"remote_ip": remoteIP,
 		"service":   service,
+		"path":      path,
 	}
 
 	requestBody, err := json.Marshal(requestData)
 	if err != nil {
+		log.Printf("[ERROR] Failed to marshal LLM request: %v", err)
 		return nil, fmt.Errorf("failed to marshal LLM request: %v", err)
 	}
+	log.Printf("[DEBUG] LLM request payload: %s", string(requestBody))
 
 	req, err := http.NewRequest("POST", llmApiUrl, bytes.NewBuffer(requestBody))
 	if err != nil {
+		log.Printf("[ERROR] Failed to create LLM API request: %v", err)
 		return nil, fmt.Errorf("failed to create LLM API request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		log.Printf("[ERROR] LLM API request failed: %v", err)
 		return nil, fmt.Errorf("LLM API request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[ERROR] LLM API responded with non-200 status: %s", resp.Status)
 		return nil, fmt.Errorf("LLM API responded with status: %s", resp.Status)
 	}
 
 	var llmResponse LLMResponse
 	if err := json.NewDecoder(resp.Body).Decode(&llmResponse); err != nil {
+		log.Printf("[ERROR] Failed to decode LLM API response: %v", err)
 		return nil, fmt.Errorf("failed to decode LLM API response: %v", err)
 	}
+	log.Printf("[DEBUG] LLM response decoded successfully for IP %s: %+v", remoteIP, llmResponse)
 
 	return &llmResponse, nil
 }
